@@ -1268,6 +1268,68 @@
         // ============================================================
 
         /**
+         * 构建自包含的 FFmpeg Worker Blob URL
+         * 将 worker.js 及其依赖 const.js、errors.js 合并成一个无外部依赖的文件
+         * 解决浏览器跨域 Worker 创建限制问题
+         * @returns {Promise<string>} 自包含 Worker 的 Blob URL
+         */
+        async function buildSelfContainedWorker() {
+            // CDN 基础路径（@ffmpeg/ffmpeg 0.12.10 ESM版本的dist目录）
+            const base = 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.10/dist/esm';
+
+            // 并行加载三个源文件
+            const [constRes, errorsRes, workerRes] = await Promise.all([
+                fetch(`${base}/const.js`),
+                fetch(`${base}/errors.js`),
+                fetch(`${base}/worker.js`)
+            ]);
+
+            // 确保所有请求成功
+            if (!constRes.ok || !errorsRes.ok || !workerRes.ok) {
+                throw new Error('加载 FFmpeg Worker 依赖文件失败，请检查网络连接');
+            }
+
+            // 读取三个文件的文本内容
+            const constText = await constRes.text();
+            const errorsText = await errorsRes.text();
+            const workerText = await workerRes.text();
+
+            // 处理 const.js：移除 export 关键字，保留变量声明
+            // 将 "export const xxx" 变为 "const xxx"
+            const constCode = constText.replace(/export\s+(const|var|let|function|class|default)\s+/g, '$1 ');
+
+            // 处理 errors.js：移除 export 关键字
+            const errorsCode = errorsText.replace(/export\s+(const|var|let|function|class|default)\s+/g, '$1 ');
+
+            // 处理 worker.js：
+            // 1. 移除顶部的 TypeScript reference 指令
+            // 2. 移除 import 语句（import { ... } from "./xxx.js";）
+            // 3. 将所有代码包裹在一个文件中
+            let workerCode = workerText
+                // 移除 TypeScript reference 注释行
+                .replace(/\/\/\/\s*<reference[^>]*>/g, '')
+                // 移除 import 语句行
+                .replace(/^\s*import\s+[^;]+;\s*$/gm, '');
+
+            // 按顺序合并三个模块：const.js → errors.js → worker.js
+            // 最终文件无任何 import 语句，是一个自包含的 ES Module Worker
+            const combinedCode = `// ===== Auto-generated self-contained FFmpeg Worker =====\n` +
+                `// 合并了 const.js + errors.js + worker.js，消除跨域导入问题\n\n` +
+                `// --- const.js 内容 ---\n` +
+                constCode + `\n\n` +
+                `// --- errors.js 内容 ---\n` +
+                errorsCode + `\n\n` +
+                `// --- worker.js 内容 ---\n` +
+                workerCode;
+
+            // 创建 Blob 对象（类型为 JavaScript 模块）
+            const blob = new Blob([combinedCode], { type: 'text/javascript' });
+
+            // 返回 Blob URL（同源，无跨域问题）
+            return URL.createObjectURL(blob);
+        }
+
+        /**
          * 初始化并加载FFmpeg内核，带持久缓存检测
          * @returns {Promise<boolean>} 加载成功返回true
          */
@@ -1291,7 +1353,13 @@
                 const { FFmpeg } = await import('@ffmpeg/ffmpeg');
                 const { fetchFile, toBlobURL } = await import('@ffmpeg/util');
 
-                // 创建FFmpeg实例
+                // ========== 【关键修复】构建自包含的 Worker Blob ==========
+                // FFmpeg.load() 内部会用 new Worker(CDN_URL) 创建跨域Worker，浏览器阻止跨域Worker创建
+                // 解决方案：将 worker.js 及其依赖 const.js、errors.js 合并成一个自包含的 Blob Worker
+                updateStatus('正在构建FFmpeg Worker模块...', 'loading', 5);
+                const ffmpegWorkerURL = await buildSelfContainedWorker();
+
+                // 创建FFmpeg实例（不传worker，在load时传classWorkerURL）
                 ffmpeg = new FFmpeg();
 
                 // 注册内核下载进度回调事件
@@ -1327,11 +1395,13 @@
                 );
                 updateStatus('正在初始化FFmpeg引擎 4/4...', 'loading', 85);
 
-                // 调用load方法加载内核，传入3个URL参数（多线程版本不需要simdCoreURL）
+                // 调用load方法加载内核，传入classWorkerURL（预加载的同源Blob URL，解决跨域问题）
+                // 同时传入coreURL/wasmURL/workerURL三个内核文件的Blob URL
                 await ffmpeg.load({
-                    coreURL: coreURL,          // 核心JS
-                    wasmURL: wasmURL,          // WASM模块
-                    workerURL: workerURL       // Worker文件（多线程必需）
+                    classWorkerURL: ffmpegWorkerURL, // 【关键】FFmpeg内部Worker的同源Blob URL
+                    coreURL: coreURL,                // 核心JS
+                    wasmURL: wasmURL,                // WASM模块
+                    workerURL: workerURL             // 内核Worker文件（多线程必需）
                 });
 
                 // 标记加载完成
