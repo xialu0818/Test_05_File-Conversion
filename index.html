@@ -1886,6 +1886,19 @@
             console.log('%c🎬 视频提取音频工具已加载', 'color: #2563eb; font-size: 16px; font-weight: bold;');
             console.log('%c💡 所有处理均在本地浏览器完成，保护隐私安全！', 'color: #059669; font-weight: 500;');
 
+            // ========== 【关键检测】file:// 协议检测 ==========
+            // ES Modules + importmap 必须在 HTTP/HTTPS 协议下运行
+            if (location.protocol === 'file:') {
+                // 延迟显示，让页面先渲染
+                setTimeout(function () {
+                    showModal(
+                        '⚠️ 本地打开需启动HTTP服务',
+                        '检测到您正在通过 file:// 协议直接打开HTML文件。\n\n由于浏览器安全限制，ES Modules（FFmpeg依赖）无法在 file:// 协议下加载。\n\n【本地运行解决方案】\n请任选一种方式启动本地HTTP服务：\n\n方式1（最简单）：使用VSCode\n安装 "Live Server" 插件 → 右键 index.html → "Open with Live Server"\n\n方式2：Python一行命令\n在HTML所在目录执行：\npython -m http.server 8080\n然后访问 http://localhost:8080\n\n方式3：部署到 Cloudflare Pages\n上传到GitHub → 连接Cloudflare Pages → 自动部署，无需本地服务器'
+                    );
+                }, 500);
+                return;
+            }
+
             // 检测SharedArrayBuffer支持情况并提示
             if (typeof SharedArrayBuffer === 'undefined') {
                 // 延迟显示提示，让页面先渲染完成
