@@ -1268,6 +1268,57 @@
         // ============================================================
 
         /**
+         * 带超时的URL加载并转为Blob URL
+         * 替代原生 toBlobURL，增加超时控制和更清晰的错误信息
+         * @param {string} url - 资源URL
+         * @param {string} mimeType - MIME类型
+         * @param {number} timeoutMs - 超时时间（毫秒）
+         * @returns {Promise<string>} Blob URL
+         */
+        async function loadWithTimeout(url, mimeType, timeoutMs) {
+            // 创建带超时的fetch请求
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+            try {
+                const response = await fetch(url, {
+                    signal: controller.signal,
+                    credentials: 'same-origin'
+                });
+
+                // 检查响应状态
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status} ${response.statusText}，URL: ${url}`);
+                }
+
+                // 读取二进制数据
+                const data = await response.arrayBuffer();
+
+                // 创建Blob并返回URL
+                const blob = new Blob([data], { type: mimeType });
+                const blobUrl = URL.createObjectURL(blob);
+
+                console.log(`[FFmpeg] 加载成功: ${url.split('/').pop()} (${(data.byteLength / 1024 / 1024).toFixed(2)}MB)`);
+
+                return blobUrl;
+            } catch (error) {
+                // 构造更详细的错误信息
+                let errMsg;
+                if (error.name === 'AbortError') {
+                    errMsg = `文件下载超时（${timeoutMs / 1000}秒），请检查网络连接或更换网络环境后重试。\n文件: ${url.split('/').pop()}`;
+                } else if (error.message && error.message.includes('HTTP')) {
+                    errMsg = `资源加载失败: ${error.message}`;
+                } else {
+                    errMsg = `加载 ${url.split('/').pop()} 失败: ${error.message || error}`;
+                }
+                throw new Error(errMsg);
+            } finally {
+                // 清理定时器
+                clearTimeout(timeoutId);
+            }
+        }
+
+        /**
          * 构建自包含的 FFmpeg Worker Blob URL
          * 将 worker.js 及其依赖 const.js、errors.js 合并成一个无外部依赖的文件
          * 解决浏览器跨域 Worker 创建限制问题
@@ -1374,24 +1425,28 @@
                 const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core-mt@0.12.10/dist/umd';
 
                 // 动态加载核心二进制文件的Blob URL（浏览器会自动缓存，二次打开无需重下）
-                updateStatus('正在加载FFmpeg内核 1/4...', 'loading', 20);
-                const coreURL = await toBlobURL(
-                    `${baseURL}/ffmpeg-core.js`,      // 核心JS文件URL
-                    'text/javascript'                  // MIME类型
+                // 使用带超时的fetch包装，防止大文件下载卡住
+                updateStatus('正在加载FFmpeg内核 1/4 (核心JS)...', 'loading', 20);
+                const coreURL = await loadWithTimeout(
+                    `${baseURL}/ffmpeg-core.js`,
+                    'text/javascript',
+                    60000  // 60秒超时
                 );
-                updateStatus('正在加载FFmpeg内核 2/4...', 'loading', 40);
+                updateStatus('正在加载FFmpeg内核 2/4 (WASM，文件较大)...', 'loading', 40);
 
-                // 加载WASM核心模块
-                const wasmURL = await toBlobURL(
-                    `${baseURL}/ffmpeg-core.wasm`,    // WASM二进制文件URL
-                    'application/wasm'                 // MIME类型
+                // 加载WASM核心模块（~30MB，使用更长超时）
+                const wasmURL = await loadWithTimeout(
+                    `${baseURL}/ffmpeg-core.wasm`,
+                    'application/wasm',
+                    120000  // 120秒超时
                 );
-                updateStatus('正在加载FFmpeg内核 3/4...', 'loading', 60);
+                updateStatus('正在加载FFmpeg内核 3/4 (Worker)...', 'loading', 60);
 
                 // 加载多线程Worker文件（多线程必需）
-                const workerURL = await toBlobURL(
-                    `${baseURL}/ffmpeg-core.worker.js`, // Worker线程文件URL
-                    'text/javascript'                    // MIME类型
+                const workerURL = await loadWithTimeout(
+                    `${baseURL}/ffmpeg-core.worker.js`,
+                    'text/javascript',
+                    60000  // 60秒超时
                 );
                 updateStatus('正在初始化FFmpeg引擎 4/4...', 'loading', 85);
 
@@ -1413,6 +1468,8 @@
             } catch (error) {
                 // 记录错误到控制台便于调试
                 console.error('FFmpeg加载失败:', error);
+                console.error('错误堆栈:', error.stack);
+
                 // 销毁失败的实例
                 try {
                     if (ffmpeg) {
@@ -1425,21 +1482,29 @@
                 // 更新状态为失败
                 updateStatus('FFmpeg内核加载失败', 'error', 0);
 
+                // 获取完整错误信息
+                const errMsg = (error.message || String(error) || '').toLowerCase();
+
                 // 显示友好错误提示弹窗
                 if (error.message && error.message.includes('SharedArrayBuffer')) {
                     showModal(
                         '浏览器环境不支持',
                         error.message
                     );
-                } else if (error.message && error.message.includes('Network') || (error.message && error.message.includes('fetch') || error.message && error.message.includes('Failed to fetch'))) {
+                } else if (error.message && error.message.includes('超时')) {
+                    showModal(
+                        '内核下载超时',
+                        error.message + '\n\n建议：使用网络速度更快的环境，或在 Cloudflare Pages 上部署后使用。'
+                    );
+                } else if (error.message && (error.message.includes('Network') || error.message.includes('fetch') || error.message.includes('Failed to fetch') || error.message.includes('HTTP'))) {
                     showModal(
                         '网络连接失败',
-                        '无法下载FFmpeg内核文件，可能是网络原因或CDN被屏蔽。\n\n请检查网络连接后刷新重试。\n如果是本地双击打开，建议部署到Cloudflare Pages等支持HTTPS的静态网站托管服务后使用。'
+                        error.message + '\n\n请检查网络连接是否能访问 cdn.jsdelivr.net。'
                     );
                 } else {
                     showModal(
                         '内核加载失败',
-                        'FFmpeg内核加载过程中发生错误：\n' + (error.message || '未知错误') + '\n\n建议刷新页面后重试。'
+                        (error.message || '未知错误') + '\n\n请打开浏览器开发者工具（F12）→ Console 面板查看详细错误日志。'
                     );
                 }
 
@@ -1745,12 +1810,19 @@
             } catch (error) {
                 // 记录详细错误到控制台
                 console.error('音频转换失败:', error);
+                console.error('错误堆栈:', error.stack);
+                console.error('错误详情:', JSON.stringify({
+                    message: error.message,
+                    name: error.name,
+                    toString: String(error)
+                }));
 
                 // 更新状态为失败
                 updateStatus('转换失败', 'error', 0);
 
-                // 分析错误类型并给出友好提示
-                const errMsg = (error.message || String(error) || '').toLowerCase();
+                // 获取完整错误信息用于弹窗显示
+                const fullErrorMessage = error.message || error.toString() || (typeof error === 'object' ? JSON.stringify(error) : String(error));
+                const errMsg = fullErrorMessage.toLowerCase();
 
                 if (errMsg.includes('memory') || errMsg.includes('out of memory') || errMsg.includes('oom') || error.name === 'RangeError') {
                     showModal(
@@ -1770,7 +1842,7 @@
                 } else {
                     showModal(
                         '转换失败',
-                        '音频提取过程中发生错误：\n' + (error.message || '未知错误') + '\n\n请刷新页面后重试，或尝试更换视频文件。'
+                        '音频提取过程中发生错误：\n' + fullErrorMessage + '\n\n请打开浏览器开发者工具（F12）查看 Console 面板获取详细错误信息，或刷新页面后重试。'
                     );
                 }
 
